@@ -1,0 +1,65 @@
+{
+  "generated_at": "2026-08-15T02:51:30.417854+00:00",
+  "program_start": "2026-08-13",
+  "snapshots_read": 3,
+  "matches_total": 107,
+  "date_range": [
+    "2026-07-02",
+    "2026-08-15"
+  ],
+  "api_window_now": [
+    "2026-07-13",
+    "2026-08-15"
+  ],
+  "matches_recovered_beyond_api_window": 7,
+  "baseline": {
+    "n": 96,
+    "premier_first": 13438,
+    "reaction_time_ms": 694.354,
+    "preaim": 11.319,
+    "spray_accuracy": 37.938,
+    "accuracy_head": 18.156,
+    "accuracy_enemy_spotted": 36.294
+  },
+  "program": {
+    "n": 11,
+    "premier_last": 13131,
+    "reaction_time_ms": 635,
+    "preaim": 11.559,
+    "spray_accuracy": 34.402,
+    "accuracy_head": 18.353,
+    "accuracy_enemy_spotted": 32.954
+  },
+  "mechanics_index_baseline_stats": {
+    "reaction_time_ms": {
+      "mean": 694.3542,
+      "stdev": 111.5399,
+      "n": 96,
+      "lower_is_better": true
+    },
+    "preaim": {
+      "mean": 11.3193,
+      "stdev": 3.2893,
+      "n": 96,
+      "lower_is_better": true
+    },
+    "spray_accuracy": {
+      "mean": 37.9379,
+      "stdev": 8.9299,
+      "n": 96,
+      "lower_is_better": false
+    },
+    "accuracy_head": {
+      "mean": 18.156,
+      "stdev": 6.4737,
+      "n": 96,
+      "lower_is_better": false
+    },
+    "accuracy_enemy_spotted": {
+      "mean": 36.2941,
+      "stdev": 4.9755,
+      "n": 96,
+      "lower_is_better": false
+    }
+  }
+}

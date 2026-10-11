@@ -12,10 +12,13 @@ through 2026-07-12 stopped being reachable. Those matches are in matches.csv
 because a snapshot caught them first.
 
 Outputs (data/processed/):
-    matches.csv      one row per match, the union of all snapshots
-    daily.csv        one row per day, for the timeline panels
-    faceit_elo.csv   FACEIT elo series (history + daily standing)
-    summary.json     headline numbers, for sanity-checking the viz
+    matches.csv         one row per Leetify match, the union of all snapshots,
+                        with FACEIT kills/ADR joined on finish time
+    faceit_matches.csv  one row per FACEIT match: kills, deaths, ADR, K/R, ELO
+    profile_stats.csv   one row per snapshot: opening duels, flashes, trades...
+    daily.csv           one row per day, for the timeline panels
+    faceit_elo.csv      FACEIT elo series (history + daily standing)
+    summary.json        headline numbers, for sanity-checking the viz
 
 Usage:
     python3 build.py
@@ -89,7 +92,9 @@ def to_row(match, first_seen_file, program_start):
         "date": day,
         "source": source,
         "is_premier": int(bool(is_premier)),
-        "premier_elo": rank if is_premier else None,
+        # rank 0 = unranked/placement. Writing it as an ELO would draw a cliff to
+        # zero on every line chart, so it becomes a gap instead.
+        "premier_elo": rank if (is_premier and rank) else None,
         "faceit_level": faceit_level,
         "map_name": match.get("map_name"),
         "outcome": match.get("outcome"),
@@ -103,8 +108,21 @@ def to_row(match, first_seen_file, program_start):
         "spray_accuracy": match.get("spray_accuracy"),
         "is_program_period": int(bool(day and day >= program_start)),
         "days_from_program_start": days_in,
+        "practice_block": practice_block(day),
         "first_seen_snapshot": first_seen_file,
     }
+
+
+def practice_block(day):
+    """Which two-week practice block a date falls in, or None outside them."""
+    if not day:
+        return None
+    if day < config.PRACTICE_START:
+        return "pre_practice"
+    for first, last, focus in config.PRACTICE_BLOCKS:
+        if first <= day <= last:
+            return focus
+    return "post_practice"
 
 
 def add_mechanics_index(rows):
@@ -200,6 +218,157 @@ def load_faceit_snapshots():
     return out
 
 
+def load_faceit_matches():
+    """One row per FACEIT match: kills, deaths, ADR, K/R from Data API v4.
+
+    stats-*.json files hold only lines that were new when captured, so a union
+    deduped on match id is the full history. Per-match ELO is not in v4; it is
+    joined in from the browser backfill (faceit_cs2_history.csv) where it exists.
+    """
+    lines = {}
+    for path in sorted(config.RAW_FACEIT.glob("stats-*.json")):
+        with open(path, encoding="utf-8") as handle:
+            for item in json.load(handle):
+                lines[item["Match Id"]] = item
+    if not lines:
+        print("no FACEIT stats-*.json (needs FACEIT_API_KEY); skipping kills")
+        return []
+
+    elo = {}
+    history = config.RAW_FACEIT / "faceit_cs2_history.csv"
+    if history.exists():
+        with open(history, encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                elo[row["match_id"]] = row
+
+    def num(value, kind=float):
+        return kind(value) if value not in (None, "") else None
+
+    out = []
+    for mid, s in lines.items():
+        finished = datetime.fromtimestamp(int(s["Match Finished At"]) / 1000,
+                                          tz=timezone.utc)
+        day = finished.date().isoformat()
+        rounds = num(s.get("Rounds"), int)
+        old = elo.get(mid, {})
+        out.append({
+            "faceit_match_id": mid,
+            "finished_at": finished.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "date": day,
+            "map_name": s.get("Map"),
+            "outcome": "win" if s.get("Result") == "1" else "loss",
+            "score": s.get("Score"),
+            "rounds": rounds,
+            "kills": num(s.get("Kills"), int),
+            "deaths": num(s.get("Deaths"), int),
+            "assists": num(s.get("Assists"), int),
+            "headshots": num(s.get("Headshots"), int),
+            "hs_pct": num(s.get("Headshots %")),
+            "kd": num(s.get("K/D Ratio")),
+            "kr": num(s.get("K/R Ratio")),
+            "adr": num(s.get("ADR")),
+            "mvps": num(s.get("MVPs"), int),
+            "multi_kills": sum(num(s.get(k), int) or 0 for k in
+                               ("Double Kills", "Triple Kills", "Quadro Kills",
+                                "Penta Kills")),
+            "kills_20_plus": int((num(s.get("Kills"), int) or 0) >= 20),
+            "elo": num(old.get("elo"), int),
+            "elo_delta": num(old.get("elo_delta"), int),
+            "is_program_period": int(day >= config.PROGRAM_START),
+            "practice_block": practice_block(day),
+        })
+    out.sort(key=lambda r: r["finished_at"])
+    print("FACEIT stats: %d matches, %s..%s"
+          % (len(out), out[0]["date"], out[-1]["date"]))
+    return out
+
+
+def join_faceit_kills(rows, faceit_rows, tolerance_s=600):
+    """Attach FACEIT kills/ADR to Leetify's FACEIT matches by finish time.
+
+    The two sources use different match ids, so the join key is time: nearest
+    FACEIT match within +-10 minutes. Two matches never finish that close
+    together, so a hit is unambiguous. Misses are counted, not hidden.
+    """
+    def ts(value):
+        return datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S").timestamp()
+
+    faceit_ts = [(ts(f["finished_at"]), f) for f in faceit_rows]
+    matched = unmatched = 0
+    for row in rows:
+        for field in ("faceit_match_id", "kills", "deaths", "adr", "kr"):
+            row[field] = None
+        if row["source"] != "faceit" or not faceit_ts:
+            continue
+        t = ts(row["finished_at"])
+        gap, best = min(((abs(t - ft), f) for ft, f in faceit_ts), key=lambda p: p[0])
+        if gap > tolerance_s:
+            unmatched += 1
+            continue
+        matched += 1
+        row.update({"faceit_match_id": best["faceit_match_id"],
+                    "kills": best["kills"], "deaths": best["deaths"],
+                    "adr": best["adr"], "kr": best["kr"]})
+    print("Leetify<->FACEIT join: %d matched, %d unmatched (+-%ds)"
+          % (matched, unmatched, tolerance_s))
+    return matched, unmatched
+
+
+# Aggregate Leetify stats worth tracking over time. Each snapshot reports them
+# over its own 100-match window, so the series is a rolling average, not a
+# per-match measurement -- consecutive points share ~99% of their matches.
+PROFILE_STATS = [
+    "ct_opening_duel_success_percentage", "t_opening_duel_success_percentage",
+    "ct_opening_aggression_success_rate", "t_opening_aggression_success_rate",
+    "trade_kills_success_percentage", "traded_deaths_success_percentage",
+    "trade_kill_opportunities_per_round",
+    "flashbang_hit_foe_per_flashbang", "flashbang_hit_friend_per_flashbang",
+    "flashbang_leading_to_kill", "flashbang_thrown", "utility_on_death_avg",
+    "he_foes_damage_avg", "he_friends_damage_avg",
+    "counter_strafing_good_shots_ratio", "spray_accuracy", "accuracy_head",
+    "accuracy_enemy_spotted", "preaim", "reaction_time_ms",
+]
+PROFILE_RATINGS = ["aim", "positioning", "utility", "clutch", "opening",
+                   "ct_leetify", "t_leetify"]
+
+
+def load_profile_stats(snapshots):
+    """One row per Leetify snapshot: ranks, ratings and window-level stats."""
+    faceit_elo = {}
+    for path in config.RAW_FACEIT.glob("user-*.json"):
+        with open(path, encoding="utf-8") as handle:
+            cs2 = (json.load(handle).get("games") or {}).get("cs2") or {}
+        faceit_elo[path.stem.split("-", 1)[1]] = cs2.get("faceit_elo")
+
+    out = []
+    for path in snapshots:
+        with open(path, encoding="utf-8") as handle:
+            profile = json.load(handle)
+        stamp = path.stem.split("-", 1)[1]
+        matches = profile.get("recent_matches") or []
+        ranks = profile.get("ranks") or {}
+        rating = profile.get("rating") or {}
+        stats = profile.get("stats") or {}
+        row = {
+            "captured_at": datetime.strptime(stamp, "%Y-%m-%dT%H%M%SZ")
+            .replace(tzinfo=timezone.utc).isoformat(),
+            "snapshot": path.name,
+            "window_start": matches[-1]["finished_at"][:10] if matches else None,
+            "window_end": matches[0]["finished_at"][:10] if matches else None,
+            "window_matches": len(matches),
+            "total_matches": profile.get("total_matches"),
+            "winrate": profile.get("winrate"),
+            "premier": ranks.get("premier"),
+            "faceit_level": ranks.get("faceit"),
+            "faceit_elo": faceit_elo.get(stamp),
+            "leetify_rank": ranks.get("leetify"),
+        }
+        row.update({"rating_" + k: rating.get(k) for k in PROFILE_RATINGS})
+        row.update({k: stats.get(k) for k in PROFILE_STATS})
+        out.append(row)
+    return out
+
+
 def write_csv(path, rows, fieldnames):
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -253,6 +422,16 @@ def main() -> int:
     print("computing mechanics index against the pre-program baseline...")
     baseline_stats = add_mechanics_index(rows)
 
+    faceit_matches = load_faceit_matches()
+    join_matched, join_unmatched = join_faceit_kills(rows, faceit_matches)
+    if faceit_matches:
+        write_csv(config.PROCESSED / "faceit_matches.csv", faceit_matches,
+                  list(faceit_matches[0].keys()))
+
+    profile_stats = load_profile_stats(snapshots)
+    write_csv(config.PROCESSED / "profile_stats.csv", profile_stats,
+              list(profile_stats[0].keys()))
+
     fields = list(rows[0].keys())
     write_csv(config.PROCESSED / "matches.csv", rows, fields)
 
@@ -304,6 +483,24 @@ def main() -> int:
                 for kk, vv in v.items()}
             for k, v in baseline_stats.items()
         },
+        "faceit": {
+            "matches": len(faceit_matches),
+            "date_range": ([faceit_matches[0]["date"], faceit_matches[-1]["date"]]
+                           if faceit_matches else None),
+            "leetify_join_matched": join_matched,
+            "leetify_join_unmatched": join_unmatched,
+            "last_50": {
+                "kills": mean_of(faceit_matches[-50:], "kills"),
+                "deaths": mean_of(faceit_matches[-50:], "deaths"),
+                "kr": mean_of(faceit_matches[-50:], "kr"),
+                "adr": mean_of(faceit_matches[-50:], "adr"),
+                "rounds": mean_of(faceit_matches[-50:], "rounds"),
+                "kills_20_plus_share": mean_of(faceit_matches[-50:], "kills_20_plus"),
+            },
+        },
+        "profile_now": {k: profile_stats[-1][k] for k in
+                        ("captured_at", "premier", "faceit_level", "faceit_elo",
+                         "total_matches")},
     }
     with open(config.PROCESSED / "summary.json", "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)

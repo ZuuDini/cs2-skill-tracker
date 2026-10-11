@@ -1,0 +1,11 @@
+-- YOUR TURN.
+-- Q: Confounder check. Per Scholas (from 2026-08-03) moved when you play.
+--    Do late-night games perform worse?
+--
+-- Table: data/processed/faceit_matches.csv
+-- finished_at is UTC. Convert to New York time:
+--    hour(timezone('America/New_York', finished_at::TIMESTAMPTZ))
+-- Group into bands (before 22:00, 22:00-00:59, 01:00+) and return n, win %,
+-- avg kr. If late games are clearly worse, that is a cheap fix -- and a
+-- confounder any before/after comparison has to mention.
+

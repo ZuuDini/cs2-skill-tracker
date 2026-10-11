@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 logs/
 .DS_Store
+.env
+.venv/
+.ipynb_checkpoints/

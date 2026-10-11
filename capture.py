@@ -98,6 +98,69 @@ def fetch_faceit_user():
     }
 
 
+def load_api_key():
+    """Read FACEIT_API_KEY from .env. Returns None if absent -- the rail is optional."""
+    if not config.ENV_FILE.exists():
+        return None
+    for line in config.ENV_FILE.read_text(encoding="utf-8").splitlines():
+        name, _, value = line.partition("=")
+        if name.strip() == "FACEIT_API_KEY" and value.strip():
+            return value.strip()
+    return None
+
+
+def known_faceit_stat_ids():
+    """Match ids already on disk from earlier stats-*.json captures."""
+    seen = set()
+    for path in config.RAW_FACEIT.glob("stats-*.json"):
+        with open(path, encoding="utf-8") as handle:
+            for item in json.load(handle):
+                seen.add(item.get("Match Id"))
+    return seen
+
+
+def fetch_faceit_match_stats(api_key):
+    """New per-match stat lines (kills, deaths, ADR, K/R) from FACEIT Data API v4.
+
+    Unlike Leetify, FACEIT history is permanent and always re-fetchable, so
+    there is no need to store overlapping copies: page backwards from the newest
+    match and stop at the first page that contains a match we already have. The
+    first ever run therefore backfills the whole CS2 history.
+
+    The stats endpoint returns only this player's own line per match -- no other
+    players' names or ids beyond opaque team ids.
+    """
+    headers = {"Authorization": "Bearer %s" % api_key, "Accept": "application/json",
+               "User-Agent": config.USER_AGENT}
+    url = "%s/players/%s/games/cs2/stats" % (config.FACEIT_DATA_API, config.FACEIT_GUID)
+    seen = known_faceit_stat_ids()
+    new, before = [], None
+    while True:
+        # The API rejects offset > 200, so page by time instead: each request
+        # asks for matches finished before the oldest one already received.
+        params = {"limit": config.FACEIT_PAGE_SIZE}
+        if before is not None:
+            params["to"] = before - 1
+        try:
+            response = requests.get(url, headers=headers, timeout=config.TIMEOUT,
+                                    params=params)
+            response.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            if not new:
+                raise
+            # Keep what we have; the next run resumes from the newest gap.
+            logging.warning("FACEIT stats paging stopped early (%s); keeping %d lines",
+                            exc, len(new))
+            break
+        items = [i.get("stats") or {} for i in response.json().get("items") or []]
+        fresh = [i for i in items if i.get("Match Id") not in seen]
+        new.extend(fresh)
+        if len(fresh) < len(items) or len(items) < config.FACEIT_PAGE_SIZE:
+            break
+        before = min(int(i["Match Finished At"]) for i in items)
+    return new
+
+
 def write_snapshot(directory, prefix: str, payload, stamp: str):
     """Write a raw response verbatim. Never overwrites an existing snapshot."""
     directory.mkdir(parents=True, exist_ok=True)
@@ -162,6 +225,20 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         logging.error("FACEIT capture FAILED: %s", exc)
         failures.append("faceit")
+
+    # --- FACEIT per-match stats: kills, deaths, ADR (needs a Data API key) ----
+    api_key = load_api_key()
+    if not api_key:
+        logging.info("no FACEIT_API_KEY in .env -- skipping per-match kill stats")
+    else:
+        try:
+            new_stats = fetch_faceit_match_stats(api_key)
+            if new_stats:
+                write_snapshot(config.RAW_FACEIT, "stats", new_stats, stamp)
+            logging.info("FACEIT stats: %d new match lines", len(new_stats))
+        except Exception as exc:  # noqa: BLE001
+            logging.error("FACEIT stats capture FAILED: %s", exc)
+            failures.append("faceit_stats")
 
     if failures:
         logging.error("capture finished with failures: %s", ", ".join(failures))

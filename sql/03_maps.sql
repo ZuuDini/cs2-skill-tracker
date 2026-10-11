@@ -1,0 +1,11 @@
+-- YOUR TURN.
+-- Q: Which maps are you actually weak on -- and which "weak maps" are just
+--    small samples?
+--
+-- Table: data/processed/faceit_matches.csv   (one row per FACEIT match)
+-- Return per map: n, win %, avg kills per round, avg ADR.
+-- Then add a 95% CI on win % (normal approximation:
+--    p +- 1.96 * sqrt(p * (1 - p) / n)  ) and sort by n.
+-- Hint: GROUP BY map_name; HAVING count(*) >= 8 hides maps too thin to judge.
+-- Stretch: compare since-program (date >= '2026-08-13') vs all-time per map.
+
